@@ -1,0 +1,30 @@
+name: Delete Vultr Instances
+
+on:
+  schedule:
+    # 运行时间表，使用 UTC 时间，每 6 小时运行一次
+    - cron: '0 */6 * * *'
+
+jobs:
+  delete-instances:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Delete all Vultr instances
+      run: |
+        API_KEY=${{ secrets.VULTR_API_KEY }}
+        BASE_URL="https://api.vultr.com/v2"
+
+        # 获取所有实例的 ID
+        INSTANCE_IDS=$(curl -s -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances" | jq -r '.instances[].id')
+
+        # 循环遍历每个实例 ID 并删除
+        for ID in $INSTANCE_IDS; do
+          echo "Deleting instance ID: $ID"
+          curl -s -X DELETE -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances/$ID"
+        done
+      env:
+        VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
