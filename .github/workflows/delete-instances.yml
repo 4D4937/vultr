@@ -2,8 +2,8 @@ name: Delete Vultr Instances
 
 on:
   schedule:
-    # 运行时间表，使用 UTC 时间，每 6 小时运行一次
     - cron: '0 */6 * * *'
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   delete-instances:
