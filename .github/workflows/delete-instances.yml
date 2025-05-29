@@ -2,7 +2,7 @@ name: Vultr Automated Snapshot Management with Instance Cleanup
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       force_delete:
