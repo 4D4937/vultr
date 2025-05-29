@@ -1,135 +1,352 @@
-name: Vultr Snapshot Backup
+name: Vultr Automated Snapshot Management
 
 on:
+  # 每6小时自动运行（UTC时间：00:00, 06:00, 12:00, 18:00）
   schedule:
-    # 每6小时运行一次
     - cron: '0 */6 * * *'
   # 支持手动触发
   workflow_dispatch:
+    inputs:
+      force_delete:
+        description: '强制删除所有现有快照（true/false）'
+        required: false
+        default: 'true'
+        type: boolean
+      timeout_minutes:
+        description: '快照创建超时时间（分钟）'
+        required: false
+        default: '30'
+        type: string
+
+env:
+  VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
+  VULTR_API_URL: "https://api.vultr.com/v2"
 
 jobs:
-  backup:
+  snapshot-management:
+    name: Vultr Snapshot Management
     runs-on: ubuntu-latest
-    env:
-      VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
-      TIMEOUT: 3600           # 监控超时时间（秒）
-      SLEEP_INTERVAL: 30      # 轮询间隔（秒）
-      DELETE_SLEEP: 1         # 删除快照时的等待（秒）
-      CREATE_SLEEP: 2         # 创建快照时的等待（秒）
+    timeout-minutes: 60
+
     steps:
-      - name: 安装依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl
+    - name: 🔧 Checkout Repository
+      uses: actions/checkout@v4
 
-      - name: 执行 Vultr 快照备份
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "===== 开始执行 Vultr 快照备份 ====="
+    - name: 📋 Setup Environment
+      run: |
+        echo "WORKFLOW_START_TIME=$(date '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+        echo "SNAPSHOT_TIMESTAMP=$(date '+%Y%m%d_%H%M%S')" >> $GITHUB_ENV
+        echo "TIMEOUT_MINUTES=${{ github.event.inputs.timeout_minutes || '30' }}" >> $GITHUB_ENV
+        echo "FORCE_DELETE=${{ github.event.inputs.force_delete || 'true' }}" >> $GITHUB_ENV
 
-          # 一、获取并删除所有现有快照
-          echo "Fetching existing snapshots..."
-          resp=$(curl -sS -H "Authorization: Bearer $VULTR_API_KEY" https://api.vultr.com/v2/snapshots)
-          mapfile -t snapshot_ids < <(echo "$resp" | jq -r '.snapshots[].id')
-          total_snapshots=${#snapshot_ids[@]}
-          echo "共发现 \$total_snapshots 个快照"
-          delete_success=0; delete_fail=0
-          for snap in "${snapshot_ids[@]}"; do
-            echo "Deleting snapshot \$snap ..."
-            code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-              -H "Authorization: Bearer $VULTR_API_KEY" \
-              https://api.vultr.com/v2/snapshots/\$snap)
-            if [ "\$code" -eq 204 ]; then
-              echo "  ✅ 已删除 \$snap"
-              delete_success=\$((delete_success+1))
+    - name: ✅ Validate API Configuration
+      run: |
+        if [ -z "$VULTR_API_KEY" ]; then
+          echo "❌ 错误: VULTR_API_KEY 未设置"
+          echo "请在仓库的 Settings > Secrets 中添加 VULTR_API_KEY"
+          exit 1
+        fi
+        
+        echo "🔐 API密钥已配置"
+        echo "🌐 API端点: $VULTR_API_URL"
+        echo "⏰ 工作流启动时间: $WORKFLOW_START_TIME"
+
+    - name: 🗑️ 第一步：删除现有快照
+      id: delete_snapshots
+      run: |
+        echo "=== 开始删除现有快照 ==="
+        
+        # 获取所有快照
+        echo "📡 获取现有快照列表..."
+        snapshots_response=$(curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
+          "$VULTR_API_URL/snapshots")
+        
+        if [ $? -ne 0 ]; then
+          echo "❌ 获取快照列表失败"
+          exit 1
+        fi
+        
+        snapshot_count=$(echo "$snapshots_response" | jq -r '.snapshots | length // 0')
+        echo "📊 发现 $snapshot_count 个现有快照"
+        
+        if [ "$snapshot_count" -eq 0 ]; then
+          echo "✅ 没有现有快照需要删除"
+          echo "deleted_count=0" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # 删除快照
+        deleted_count=0
+        failed_count=0
+        
+        echo "$snapshots_response" | jq -r '.snapshots[]? | select(.id != null) | @base64' | while read -r snapshot_data; do
+          snapshot=$(echo "$snapshot_data" | base64 --decode)
+          snapshot_id=$(echo "$snapshot" | jq -r '.id')
+          snapshot_desc=$(echo "$snapshot" | jq -r '.description // "无描述"')
+          created_date=$(echo "$snapshot" | jq -r '.date_created // "未知时间"')
+          
+          echo "🗑️ 删除快照: $snapshot_id ($snapshot_desc, 创建于: $created_date)"
+          
+          if [ "$FORCE_DELETE" == "true" ]; then
+            delete_response=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $VULTR_API_KEY" \
+              -X DELETE "$VULTR_API_URL/snapshots/$snapshot_id")
+            
+            http_code=$(echo "$delete_response" | tail -c 4)
+            
+            if [ "$http_code" = "204" ] || [ "$http_code" = "200" ]; then
+              echo "   ✅ 成功删除"
+              ((deleted_count++))
             else
-              echo "::warning:: ❌ 删除 \$snap 失败 (HTTP \$code)"
-              delete_fail=\$((delete_fail+1))
+              echo "   ❌ 删除失败 (HTTP $http_code)"
+              ((failed_count++))
             fi
-            sleep \$DELETE_SLEEP
-          done
-          echo "删除快照结果：成功 \$delete_success/\$total_snapshots，失败 \$delete_fail"
-          echo
+          else
+            echo "   ⚠️ 跳过删除 (force_delete=false)"
+          fi
+          
+          # 避免API限制
+          sleep 2
+        done
+        
+        echo "deleted_count=$deleted_count" >> $GITHUB_OUTPUT
+        echo "failed_count=$failed_count" >> $GITHUB_OUTPUT
+        echo "=== 快照删除完成 ==="
 
-          # 二、获取所有实例并创建新快照
-          echo "Fetching instances..."
-          inst_json=$(curl -sS -H "Authorization: Bearer $VULTR_API_KEY" https://api.vultr.com/v2/instances)
-          mapfile -t instance_ids < <(echo "\$inst_json" | jq -r '.instances[].id')
-          total_instances=${#instance_ids[@]}
-          echo "共发现 \$total_instances 个实例"
-          created_success=0; created_fail=0
-          > created_snapshot_ids.txt
-          for id in "\${instance_ids[@]}"; do
-            info=\$(echo "\$inst_json" | jq -r --arg ID "\$id" '.instances[] | select(.id==\$ID)')
-            status=\$(echo "\$info" | jq -r '.status')
-            power=\$(echo "\$info" | jq -r '.power_status')
-            plan=\$(echo "\$info" | jq -r '.plan')
-            region=\$(echo "\$info" | jq -r '.region')
-            echo "Instance \$id: status=\$status, power=\$power, plan=\$plan, region=\$region"
+    - name: 📋 第二步：获取Vultr实例信息
+      id: get_instances
+      run: |
+        echo "=== 获取Vultr实例信息 ==="
+        
+        # 获取所有实例
+        instances_response=$(curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
+          "$VULTR_API_URL/instances")
+        
+        if [ $? -ne 0 ]; then
+          echo "❌ 获取实例列表失败"
+          exit 1
+        fi
+        
+        # 检查响应格式
+        instance_count=$(echo "$instances_response" | jq -r '.instances | length // 0')
+        echo "📊 发现 $instance_count 个实例"
+        
+        if [ "$instance_count" -eq 0 ]; then
+          echo "⚠️ 没有发现任何实例"
+          echo "instance_count=0" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # 显示实例详情
+        echo "📋 实例详细信息:"
+        echo "$instances_response" | jq -r '
+          .instances[]? | 
+          "🖥️ 实例ID: \(.id // "未知")
+           📍 标签: \(.label // "未命名")
+           🔋 状态: \(.status // "未知") | 电源: \(.power_status // "未知")
+           💾 计划: \(.plan // "未知") | 区域: \(.region // "未知")
+           🌐 主IP: \(.main_ip // "未分配")
+           📅 创建时间: \(.date_created // "未知")
+           =================="
+        '
+        
+        # 保存活跃实例ID
+        active_instances=$(echo "$instances_response" | jq -r '
+          [.instances[]? | select(.status == "active") | .id] | join(" ")
+        ')
+        
+        active_count=$(echo "$instances_response" | jq -r '
+          [.instances[]? | select(.status == "active")] | length
+        ')
+        
+        echo "🟢 活跃实例数量: $active_count"
+        echo "active_instances=$active_instances" >> $GITHUB_OUTPUT
+        echo "instance_count=$instance_count" >> $GITHUB_OUTPUT
+        echo "active_count=$active_count" >> $GITHUB_OUTPUT
 
-            timestamp=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            desc="gh-action-backup-\$id-\$timestamp"
-            echo "Creating snapshot for instance \$id ..."
-            out=\$(curl -sS -w "\n%{http_code}" -X POST \
-              -H "Content-Type: application/json" \
-              -H "Authorization: Bearer $VULTR_API_KEY" \
-              -d "{\"description\":\"\$desc\"}" \
-              https://api.vultr.com/v2/instances/\$id/snapshots)
-            body=\$(echo "\$out" | sed '\$d')
-            code=\$(echo "\$out" | tail -n1)
-            if [ "\$code" -eq 202 ]; then
-              snap_id=\$(echo "\$body" | jq -r '.snapshot.id')
-              echo "  ✅ Queued snapshot \$snap_id for instance \$id"
-              echo "\$snap_id" >> created_snapshot_ids.txt
-              created_success=\$((created_success+1))
+    - name: 📸 第三步：创建新快照
+      id: create_snapshots
+      run: |
+        echo "=== 开始创建新快照 ==="
+        
+        active_instances="${{ steps.get_instances.outputs.active_instances }}"
+        active_count="${{ steps.get_instances.outputs.active_count }}"
+        
+        if [ "$active_count" -eq 0 ]; then
+          echo "⚠️ 没有活跃实例，跳过快照创建"
+          echo "created_snapshots=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        created_snapshots=""
+        success_count=0
+        
+        for instance_id in $active_instances; do
+          echo "📸 为实例 $instance_id 创建快照..."
+          
+          # 生成快照描述
+          snapshot_desc="AutoBackup_${SNAPSHOT_TIMESTAMP}_${instance_id}"
+          
+          # 创建快照
+          create_response=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $VULTR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -X POST "$VULTR_API_URL/snapshots" \
+            -d "{
+              \"instance_id\": \"$instance_id\",
+              \"description\": \"$snapshot_desc\"
+            }")
+          
+          http_code=$(echo "$create_response" | tail -1)
+          response_body=$(echo "$create_response" | head -n -1)
+          
+          if [ "$http_code" = "201" ] || [ "$http_code" = "200" ]; then
+            snapshot_id=$(echo "$response_body" | jq -r '.snapshot.id // empty')
+            if [ -n "$snapshot_id" ]; then
+              echo "   ✅ 快照创建请求成功 - ID: $snapshot_id"
+              created_snapshots="$created_snapshots $snapshot_id"
+              ((success_count++))
             else
-              echo "::error:: ❌ 创建实例 \$id 快照失败 (HTTP \$code)"
-              echo "Response: \$body"
-              created_fail=\$((created_fail+1))
+              echo "   ⚠️ 快照创建响应格式异常"
             fi
-            sleep \$CREATE_SLEEP
+          else
+            echo "   ❌ 快照创建失败 (HTTP $http_code)"
+            echo "   响应: $response_body"
+          fi
+          
+          # 避免API限制
+          sleep 3
+        done
+        
+        echo "created_snapshots=$created_snapshots" >> $GITHUB_OUTPUT
+        echo "success_count=$success_count" >> $GITHUB_OUTPUT
+        echo "=== 快照创建请求完成 ==="
+
+    - name: ⏳ 第四步：监控快照创建状态
+      id: monitor_snapshots
+      run: |
+        echo "=== 监控快照创建状态 ==="
+        
+        created_snapshots="${{ steps.create_snapshots.outputs.created_snapshots }}"
+        timeout_minutes="$TIMEOUT_MINUTES"
+        
+        if [ -z "$created_snapshots" ]; then
+          echo "⚠️ 没有需要监控的快照"
+          exit 0
+        fi
+        
+        echo "📊 监控快照: $created_snapshots"
+        echo "⏱️ 超时时间: $timeout_minutes 分钟"
+        
+        start_time=$(date +%s)
+        timeout_seconds=$((timeout_minutes * 60))
+        completed_count=0
+        total_snapshots=$(echo $created_snapshots | wc -w)
+        
+        while [ $completed_count -lt $total_snapshots ]; do
+          current_time=$(date +%s)
+          elapsed=$((current_time - start_time))
+          
+          if [ $elapsed -gt $timeout_seconds ]; then
+            echo "⏰ 监控超时 ($timeout_minutes 分钟)"
+            break
+          fi
+          
+          echo "🔄 检查快照状态... (已用时: $((elapsed/60))分钟)"
+          completed_count=0
+          
+          for snapshot_id in $created_snapshots; do
+            status_response=$(curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
+              "$VULTR_API_URL/snapshots/$snapshot_id")
+            
+            if [ $? -eq 0 ]; then
+              status=$(echo "$status_response" | jq -r '.snapshot.status // "unknown"')
+              description=$(echo "$status_response" | jq -r '.snapshot.description // "未知"')
+              
+              case "$status" in
+                "complete")
+                  echo "   ✅ $snapshot_id: 完成 ($description)"
+                  ((completed_count++))
+                  ;;
+                "pending")
+                  echo "   ⏳ $snapshot_id: 创建中 ($description)"
+                  ;;
+                *)
+                  echo "   ❓ $snapshot_id: $status ($description)"
+                  ;;
+              esac
+            else
+              echo "   ❌ $snapshot_id: 状态检查失败"
+            fi
           done
-          echo "创建快照结果：成功 \$created_success/\$total_instances，失败 \$created_fail"
-          echo
+          
+          echo "📈 进度: $completed_count/$total_snapshots 完成"
+          
+          if [ $completed_count -lt $total_snapshots ]; then
+            echo "💤 等待30秒后重新检查..."
+            sleep 30
+          fi
+        done
+        
+        echo "final_completed=$completed_count" >> $GITHUB_OUTPUT
+        echo "total_snapshots=$total_snapshots" >> $GITHUB_OUTPUT
+        echo "=== 快照监控完成 ==="
 
-          # 三、监控快照创建状态
-          echo "Monitoring snapshot statuses..."
-          total_new=\$(wc -l < created_snapshot_ids.txt)
-          monitor_success=0; monitor_timeout=0; monitor_other=0
-          while read -r snap; do
-            echo ">> Snapshot \$snap"
-            start=\$(date +%s)
-            while true; do
-              r=\$(curl -sS -H "Authorization: Bearer $VULTR_API_KEY" https://api.vultr.com/v2/snapshots/\$snap)
-              st=\$(echo "\$r" | jq -r '.snapshot.status')
-              echo "   status: \$st"
-              if [ "\$st" = "complete" ]; then
-                echo "   ✅ 完成"
-                monitor_success=\$((monitor_success+1))
-                break
-              elif [ "\$st" = "pending" ]; then
-                now=\$(date +%s)
-                elapsed=\$((now - start))
-                if [ \$elapsed -ge \$TIMEOUT ]; then
-                  echo "::error::   ⏱ 超时 (\$elapsed 秒)"
-                  monitor_timeout=\$((monitor_timeout+1))
-                  break
-                fi
-                sleep \$SLEEP_INTERVAL
-              else
-                echo "::warning::   ❗️ 异常状态 \$st"
-                monitor_other=\$((monitor_other+1))
-                break
-              fi
-            done
-          done < created_snapshot_ids.txt
-          echo "监控结果：完成 \$monitor_success/\$total_new，超时 \$monitor_timeout，其他 \$monitor_other"
-          echo
+    - name: 📊 生成操作总结报告
+      run: |
+        echo "=== Vultr快照管理总结报告 ==="
+        echo "🕐 执行时间: $WORKFLOW_START_TIME"
+        echo "⚙️ 触发方式: ${{ github.event_name }}"
+        
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "👤 手动触发参数:"
+          echo "   - 强制删除: ${{ github.event.inputs.force_delete }}"
+          echo "   - 超时时间: ${{ github.event.inputs.timeout_minutes }}分钟"
+        fi
+        
+        echo ""
+        echo "📋 操作结果:"
+        
+        # 删除快照结果
+        deleted_count="${{ steps.delete_snapshots.outputs.deleted_count || '0' }}"
+        echo "🗑️ 删除快照: $deleted_count 个"
+        
+        # 实例信息
+        total_instances="${{ steps.get_instances.outputs.instance_count || '0' }}"
+        active_instances="${{ steps.get_instances.outputs.active_count || '0' }}"
+        echo "🖥️ 总实例数: $total_instances 个"
+        echo "🟢 活跃实例: $active_instances 个"
+        
+        # 快照创建结果
+        created_count="${{ steps.create_snapshots.outputs.success_count || '0' }}"
+        completed_count="${{ steps.monitor_snapshots.outputs.final_completed || '0' }}"
+        total_snapshots="${{ steps.monitor_snapshots.outputs.total_snapshots || '0' }}"
+        
+        echo "📸 快照创建请求: $created_count 个"
+        echo "✅ 快照创建完成: $completed_count/$total_snapshots 个"
+        
+        # 状态判断
+        if [ "$completed_count" -eq "$total_snapshots" ] && [ "$total_snapshots" -gt 0 ]; then
+          echo "🎉 状态: 全部成功"
+        elif [ "$completed_count" -gt 0 ]; then
+          echo "⚠️ 状态: 部分成功"
+        elif [ "$total_snapshots" -gt 0 ]; then
+          echo "❌ 状态: 失败"
+        else
+          echo "💡 状态: 无操作需要执行"
+        fi
+        
+        echo ""
+        echo "⏰ 下次自动执行: 6小时后"
+        echo "🔧 手动触发: 访问 Actions 标签页"
+        echo "==============================================="
 
-          # 四、操作总结
-          echo "===== Vultr 备份总结 ====="
-          echo "1）删除快照：成功 \$delete_success/\$total_snapshots，失败 \$delete_fail"
-          echo "2）创建快照：成功 \$created_success/\$total_instances，失败 \$created_fail"
-          echo "3）监控完成：\$monitor_success/\$total_new，超时 \$monitor_timeout，其他 \$monitor_other"
-          echo "===== 备份流程结束 ====="
+    - name: 🚨 错误通知
+      if: failure()
+      run: |
+        echo "❌ 工作流执行失败!"
+        echo "📅 失败时间: $(date '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "🔍 请检查上述步骤的错误日志"
+        echo "💡 常见问题:"
+        echo "   1. 检查 VULTR_API_KEY 是否正确设置"
+        echo "   2. 确认API密钥有足够权限"
+        echo "   3. 检查网络连接状态"
+        echo "   4. 验证Vultr API服务状态"
