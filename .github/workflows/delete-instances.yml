@@ -1,192 +1,320 @@
-name: Clean Snapshots, Snapshot Vultr Instances
+name: Vultr Snapshot Management
 
 on:
+  # 每6小时自动运行一次 (00:00, 06:00, 12:00, 18:00)
   schedule:
     - cron: '0 */6 * * *'
-  workflow_dispatch: # 允许手动触发
+  
+  # 支持手动触发
+  workflow_dispatch:
+
+env:
+  VULTR_API_URL: "https://api.vultr.com/v2"
+  MAX_RETRIES: 30
+  RETRY_INTERVAL: 30
 
 jobs:
-  clean-snapshot-instances:
+  vultr-snapshot-management:
     runs-on: ubuntu-latest
-
+    
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-    - name: Delete all snapshots and create new snapshots
+    - name: Validate API key
       run: |
-        API_KEY=${{ secrets.VULTR_API_KEY }}
-        BASE_URL="https://api.vultr.com/v2"
-
-        # 第一步：删除所有现有快照
-        echo "=== Step 1: Deleting all existing snapshots ==="
-        SNAPSHOTS=$(curl -s -H "Authorization: Bearer $API_KEY" "${BASE_URL}/snapshots")
-        SNAPSHOT_IDS=$(echo "$SNAPSHOTS" | jq -r '.snapshots[].id')
-
-        if [ -n "$SNAPSHOT_IDS" ] && [ "$SNAPSHOT_IDS" != "" ]; then
-          for SNAPSHOT_ID in $SNAPSHOT_IDS; do
-            SNAPSHOT_DESC=$(echo "$SNAPSHOTS" | jq -r ".snapshots[] | select(.id==\"$SNAPSHOT_ID\") | .description")
-            echo "Deleting snapshot ID: $SNAPSHOT_ID (Description: $SNAPSHOT_DESC)"
-            DELETE_RESPONSE=$(curl -s -X DELETE -H "Authorization: Bearer $API_KEY" "${BASE_URL}/snapshots/$SNAPSHOT_ID")
-            if [ -z "$DELETE_RESPONSE" ]; then
-              echo "Snapshot $SNAPSHOT_ID deleted successfully"
-            else
-              echo "Response for snapshot $SNAPSHOT_ID deletion: $DELETE_RESPONSE"
-            fi
-          done
-          echo "All existing snapshots deleted"
-        else
-          echo "No existing snapshots found"
+        if [ -z "${{ secrets.VULTR_API_KEY }}" ]; then
+          echo "❌ VULTR_API_KEY secret is not set"
+          exit 1
         fi
+        echo "✅ API key validation passed"
 
-        # 等待快照删除完成
-        sleep 10
-
-        # 第二步：获取所有实例信息并显示详细信息
-        echo "=== Step 2: Getting instance information ==="
-        INSTANCES=$(curl -s -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances")
-        echo "Full instances response:"
-        echo "$INSTANCES" | jq '.'
+    - name: Step 1 - Delete existing snapshots
+      run: |
+        echo "🗑️ Starting cleanup of existing snapshots..."
         
-        INSTANCE_IDS=$(echo "$INSTANCES" | jq -r '.instances[].id')
+        # 获取所有现有快照
+        snapshots=$(curl -s -X GET \
+          -H "Authorization: Bearer ${{ secrets.VULTR_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          "$VULTR_API_URL/snapshots")
+        
+        # 检查API响应
+        if [ $? -ne 0 ]; then
+          echo "❌ Failed to fetch snapshots"
+          exit 1
+        fi
+        
+        snapshot_count=$(echo "$snapshots" | jq -r '.snapshots | length')
+        
+        if [ "$snapshot_count" -eq 0 ]; then
+          echo "ℹ️ No existing snapshots found"
+        else
+          echo "📋 Found $snapshot_count existing snapshots"
+          
+          # 显示现有快照信息
+          echo "Existing snapshots:"
+          echo "$snapshots" | jq -r '.snapshots[] | "- ID: \(.id) | Description: \(.description) | Status: \(.status) | Size: \(.size_bytes // 0 | tonumber / 1024 / 1024 / 1024 | floor)GB | Created: \(.date_created)"'
+          
+          # 删除所有现有快照
+          deleted_count=0
+          failed_count=0
+          
+          echo "$snapshots" | jq -r '.snapshots[].id' | while read snapshot_id; do
+            echo "🗑️ Deleting snapshot: $snapshot_id"
+            
+            response=$(curl -s -w "%{http_code}" -X DELETE \
+              -H "Authorization: Bearer ${{ secrets.VULTR_API_KEY }}" \
+              "$VULTR_API_URL/snapshots/$snapshot_id")
+            
+            http_code="${response: -3}"
+            
+            if [ "$http_code" = "204" ] || [ "$http_code" = "404" ]; then
+              echo "✅ Successfully deleted snapshot: $snapshot_id"
+            else
+              echo "❌ Failed to delete snapshot $snapshot_id (HTTP: $http_code)"
+            fi
+            
+            sleep 2  # 避免API限制
+          done
+        fi
+        
+        echo "✅ Snapshot cleanup completed"
 
-        if [ -z "$INSTANCE_IDS" ] || [ "$INSTANCE_IDS" = "" ]; then
-          echo "No instances found"
+    - name: Step 2 - Get Vultr instances
+      id: get_instances
+      run: |
+        echo "🔍 Fetching Vultr instances..."
+        
+        instances=$(curl -s -X GET \
+          -H "Authorization: Bearer ${{ secrets.VULTR_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          "$VULTR_API_URL/instances")
+        
+        if [ $? -ne 0 ]; then
+          echo "❌ Failed to fetch instances"
+          exit 1
+        fi
+        
+        instance_count=$(echo "$instances" | jq -r '.instances | length')
+        
+        if [ "$instance_count" -eq 0 ]; then
+          echo "ℹ️ No instances found"
+          echo "instance_count=0" >> $GITHUB_OUTPUT
           exit 0
         fi
+        
+        echo "📋 Found $instance_count instances"
+        echo "instance_count=$instance_count" >> $GITHUB_OUTPUT
+        
+        # 保存实例信息到文件
+        echo "$instances" > instances.json
+        
+        # 显示实例详情
+        echo "Instance details:"
+        echo "$instances" | jq -r '.instances[] | "- ID: \(.id) | Label: \(.label) | Status: \(.status) | Power: \(.power_status) | Plan: \(.plan) | Region: \(.region) | OS: \(.os) | RAM: \(.ram)MB | Disk: \(.disk)GB | IP: \(.main_ip)"'
+        
+        # 过滤活跃实例
+        active_instances=$(echo "$instances" | jq '[.instances[] | select(.status == "active" and .power_status == "running")]')
+        active_count=$(echo "$active_instances" | jq 'length')
+        
+        echo "active_count=$active_count" >> $GITHUB_OUTPUT
+        echo "$active_instances" > active_instances.json
+        
+        echo "✅ Found $active_count active instances for backup"
 
-        echo "Found instances: $(echo "$INSTANCE_IDS" | wc -w)"
-
-        # 显示每个实例的详细信息
-        echo "=== Instance Details ==="
-        for ID in $INSTANCE_IDS; do
-          echo "Checking instance: $ID"
-          INSTANCE_INFO=$(echo "$INSTANCES" | jq -r ".instances[] | select(.id==\"$ID\")")
-          echo "Instance details:"
-          echo "$INSTANCE_INFO" | jq '.'
+    - name: Step 3 - Create new snapshots
+      if: steps.get_instances.outputs.active_count > 0
+      id: create_snapshots
+      run: |
+        echo "📸 Creating new snapshots..."
+        
+        timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+        active_instances=$(cat active_instances.json)
+        
+        # 创建数组存储快照信息
+        snapshot_jobs="[]"
+        created_count=0
+        failed_count=0
+        
+        echo "$active_instances" | jq -c '.[]' | while read instance; do
+          instance_id=$(echo "$instance" | jq -r '.id')
+          instance_label=$(echo "$instance" | jq -r '.label')
           
-          STATUS=$(echo "$INSTANCE_INFO" | jq -r '.status')
-          POWER_STATUS=$(echo "$INSTANCE_INFO" | jq -r '.power_status')
-          SERVER_STATUS=$(echo "$INSTANCE_INFO" | jq -r '.server_status')
-          PLAN=$(echo "$INSTANCE_INFO" | jq -r '.plan')
-          REGION=$(echo "$INSTANCE_INFO" | jq -r '.region')
+          # 创建快照描述
+          snapshot_description="Auto-backup-${instance_label}-${timestamp}"
           
-          echo "Instance $ID - Status: $STATUS, Power: $POWER_STATUS, Server: $SERVER_STATUS, Plan: $PLAN, Region: $REGION"
-        done
-
-        # 第三步：为每个实例创建新快照
-        echo "=== Step 3: Creating new snapshots ==="
-        declare -A SNAPSHOT_MAP
-        for ID in $INSTANCE_IDS; do
-          INSTANCE_LABEL=$(echo "$INSTANCES" | jq -r ".instances[] | select(.id==\"$ID\") | .label")
-          INSTANCE_STATUS=$(echo "$INSTANCES" | jq -r ".instances[] | select(.id==\"$ID\") | .status")
-          POWER_STATUS=$(echo "$INSTANCES" | jq -r ".instances[] | select(.id==\"$ID\") | .power_status")
+          echo "📸 Creating snapshot for instance: $instance_id ($instance_label)"
           
-          # 如果标签为空，使用实例ID的前8位作为标识
-          if [ "$INSTANCE_LABEL" = "null" ] || [ -z "$INSTANCE_LABEL" ]; then
-            INSTANCE_LABEL=$(echo "$ID" | cut -c1-8)
-          fi
-          
-          SNAPSHOT_DESCRIPTION="Backup snapshot of $INSTANCE_LABEL - $(date '+%Y-%m-%d %H:%M:%S')"
-          
-          echo "Creating snapshot for instance ID: $ID"
-          echo "  Label: $INSTANCE_LABEL"
-          echo "  Status: $INSTANCE_STATUS"
-          echo "  Power Status: $POWER_STATUS"
-          echo "  Snapshot Description: $SNAPSHOT_DESCRIPTION"
-          
-          # 检查实例状态
-          if [ "$INSTANCE_STATUS" != "active" ]; then
-            echo "  Warning: Instance $ID is not in 'active' status, attempting snapshot anyway..."
-          fi
-          
-          # 尝试创建快照
-          echo "  Making API call to create snapshot..."
-          SNAPSHOT_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST \
-            -H "Authorization: Bearer $API_KEY" \
+          # 创建快照请求
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer ${{ secrets.VULTR_API_KEY }}" \
             -H "Content-Type: application/json" \
-            -d "{\"description\": \"$SNAPSHOT_DESCRIPTION\"}" \
-            "${BASE_URL}/instances/$ID/snapshots")
+            -d "{\"description\": \"$snapshot_description\"}" \
+            "$VULTR_API_URL/instances/$instance_id/snapshots")
           
-          # 分离HTTP状态码和响应体
-          HTTP_STATUS=$(echo "$SNAPSHOT_RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
-          RESPONSE_BODY=$(echo "$SNAPSHOT_RESPONSE" | sed '/HTTP_STATUS:/d')
+          # 分离响应体和状态码
+          http_code=$(echo "$response" | tail -n1)
+          response_body=$(echo "$response" | head -n -1)
           
-          echo "  HTTP Status: $HTTP_STATUS"
-          echo "  Response Body: $RESPONSE_BODY"
-          
-          if [ "$HTTP_STATUS" = "201" ] || [ "$HTTP_STATUS" = "200" ]; then
-            SNAPSHOT_ID=$(echo "$RESPONSE_BODY" | jq -r '.snapshot.id')
-            if [ "$SNAPSHOT_ID" != "null" ] && [ -n "$SNAPSHOT_ID" ]; then
-              echo "  Snapshot created successfully: $SNAPSHOT_ID"
-              SNAPSHOT_MAP[$ID]=$SNAPSHOT_ID
-            else
-              echo "  Failed to extract snapshot ID from response"
-            fi
-          else
-            echo "  Failed to create snapshot for instance $ID"
-            echo "  Error details: $RESPONSE_BODY"
+          if [ "$http_code" = "202" ]; then
+            snapshot_id=$(echo "$response_body" | jq -r '.snapshot.id')
+            echo "✅ Snapshot creation initiated: $snapshot_id"
             
-            # 尝试获取更详细的实例信息
-            echo "  Getting detailed instance info..."
-            DETAILED_INFO=$(curl -s -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances/$ID")
-            echo "  Detailed instance info: $DETAILED_INFO"
+            # 保存快照信息
+            snapshot_info="{\"snapshot_id\":\"$snapshot_id\",\"instance_id\":\"$instance_id\",\"instance_label\":\"$instance_label\",\"description\":\"$snapshot_description\"}"
+            snapshot_jobs=$(echo "$snapshot_jobs" | jq ". += [$snapshot_info]")
+          else
+            echo "❌ Failed to create snapshot for instance $instance_id (HTTP: $http_code)"
+            echo "Response: $response_body"
           fi
           
-          echo "  ---"
+          sleep 3  # 避免API限制
         done
+        
+        # 保存快照任务信息
+        echo "$snapshot_jobs" > snapshot_jobs.json
+        job_count=$(echo "$snapshot_jobs" | jq 'length')
+        echo "snapshot_jobs_count=$job_count" >> $GITHUB_OUTPUT
+        
+        echo "✅ Initiated $job_count snapshot creation jobs"
 
-        # 第四步：等待快照创建完成
-        if [ ${#SNAPSHOT_MAP[@]} -gt 0 ]; then
-          echo "=== Step 4: Waiting for snapshots to complete ==="
-          sleep 30
-
-          # 检查快照状态并等待完成
-          for ID in "${!SNAPSHOT_MAP[@]}"; do
-            SNAPSHOT_ID=${SNAPSHOT_MAP[$ID]}
-            echo "Checking snapshot status for instance $ID (snapshot: $SNAPSHOT_ID)"
+    - name: Step 4 - Monitor snapshot creation status
+      if: steps.create_snapshots.outputs.snapshot_jobs_count > 0
+      run: |
+        echo "⏳ Monitoring snapshot creation progress..."
+        
+        if [ ! -f "snapshot_jobs.json" ]; then
+          echo "❌ No snapshot jobs file found"
+          exit 1
+        fi
+        
+        snapshot_jobs=$(cat snapshot_jobs.json)
+        total_jobs=$(echo "$snapshot_jobs" | jq 'length')
+        
+        if [ "$total_jobs" -eq 0 ]; then
+          echo "ℹ️ No snapshot jobs to monitor"
+          exit 0
+        fi
+        
+        echo "📊 Monitoring $total_jobs snapshot creation jobs..."
+        
+        retry_count=0
+        completed_count=0
+        failed_count=0
+        
+        while [ $retry_count -lt $MAX_RETRIES ]; do
+          echo "🔄 Check #$((retry_count + 1))/$MAX_RETRIES"
+          
+          pending_jobs=0
+          current_completed=0
+          current_failed=0
+          
+          echo "$snapshot_jobs" | jq -c '.[]' | while read job; do
+            snapshot_id=$(echo "$job" | jq -r '.snapshot_id')
+            instance_label=$(echo "$job" | jq -r '.instance_label')
             
-            # 最多等待10分钟
-            MAX_ATTEMPTS=20
-            ATTEMPT=0
+            # 检查快照状态
+            status_response=$(curl -s -X GET \
+              -H "Authorization: Bearer ${{ secrets.VULTR_API_KEY }}" \
+              "$VULTR_API_URL/snapshots/$snapshot_id")
             
-            while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-              SNAPSHOT_STATUS=$(curl -s -H "Authorization: Bearer $API_KEY" \
-                "${BASE_URL}/snapshots/$SNAPSHOT_ID" | jq -r '.snapshot.status')
+            if [ $? -eq 0 ]; then
+              status=$(echo "$status_response" | jq -r '.snapshot.status // "unknown"')
+              size_bytes=$(echo "$status_response" | jq -r '.snapshot.size_bytes // 0')
+              size_gb=$((size_bytes / 1024 / 1024 / 1024))
               
-              echo "Snapshot $SNAPSHOT_ID status: $SNAPSHOT_STATUS"
-              
-              if [ "$SNAPSHOT_STATUS" = "complete" ]; then
-                echo "Snapshot $SNAPSHOT_ID is complete"
-                break
-              elif [ "$SNAPSHOT_STATUS" = "pending" ]; then
-                echo "Snapshot $SNAPSHOT_ID is still pending, waiting..."
-                sleep 30
-                ATTEMPT=$((ATTEMPT + 1))
-              else
-                echo "Snapshot status: $SNAPSHOT_STATUS (continuing anyway)"
-                break
-              fi
-            done
-            
-            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-              echo "Warning: Snapshot $SNAPSHOT_ID did not complete within the timeout period"
+              case "$status" in
+                "complete")
+                  echo "✅ Snapshot $snapshot_id ($instance_label): Complete (${size_gb}GB)"
+                  ;;
+                "pending")
+                  echo "⏳ Snapshot $snapshot_id ($instance_label): In progress..."
+                  pending_jobs=$((pending_jobs + 1))
+                  ;;
+                "unknown"|"")
+                  echo "❓ Snapshot $snapshot_id ($instance_label): Status unknown"
+                  pending_jobs=$((pending_jobs + 1))
+                  ;;
+                *)
+                  echo "❌ Snapshot $snapshot_id ($instance_label): Failed (Status: $status)"
+                  ;;
+              esac
+            else
+              echo "⚠️ Failed to check status for snapshot $snapshot_id"
+              pending_jobs=$((pending_jobs + 1))
             fi
+            
+            sleep 1  # 避免API限制
           done
-        else
-          echo "=== No snapshots were created ==="
+          
+          if [ $pending_jobs -eq 0 ]; then
+            echo "🎉 All snapshots completed!"
+            break
+          fi
+          
+          retry_count=$((retry_count + 1))
+          
+          if [ $retry_count -lt $MAX_RETRIES ]; then
+            echo "⏱️ $pending_jobs snapshots still pending. Waiting ${RETRY_INTERVAL}s before next check..."
+            sleep $RETRY_INTERVAL
+          fi
+        done
+        
+        if [ $retry_count -eq $MAX_RETRIES ]; then
+          echo "⚠️ Monitoring timeout reached. Some snapshots may still be in progress."
         fi
 
-        # 操作总结
-        echo "=== Operation Summary ==="
-        DELETED_SNAPSHOTS=$(echo "$SNAPSHOT_IDS" | wc -w)
-        CREATED_SNAPSHOTS=${#SNAPSHOT_MAP[@]}
-        TOTAL_INSTANCES=$(echo "$INSTANCE_IDS" | wc -w)
+    - name: Generate summary report
+      if: always()
+      run: |
+        echo "📊 === VULTR SNAPSHOT MANAGEMENT SUMMARY ==="
+        echo "⏰ Execution time: $(date)"
+        echo ""
         
-        echo "Deleted old snapshots: $DELETED_SNAPSHOTS"
-        echo "Created new snapshots: $CREATED_SNAPSHOTS"
-        echo "Total instances (preserved): $TOTAL_INSTANCES"
-        echo "Snapshot operations completed!"
+        # 实例统计
+        if [ -f "instances.json" ]; then
+          total_instances=$(cat instances.json | jq -r '.instances | length')
+          echo "🖥️ Total instances: $total_instances"
+          
+          if [ -f "active_instances.json" ]; then
+            active_instances=$(cat active_instances.json | jq 'length')
+            echo "✅ Active instances: $active_instances"
+          fi
+        fi
+        
+        # 快照统计
+        if [ -f "snapshot_jobs.json" ]; then
+          snapshot_jobs=$(cat snapshot_jobs.json | jq 'length')
+          echo "📸 Snapshot jobs initiated: $snapshot_jobs"
+        fi
+        
+        echo ""
+        echo "🔗 Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        echo ""
+        
+        # 获取最新快照状态
+        echo "📋 Final snapshot status:"
+        final_snapshots=$(curl -s -X GET \
+          -H "Authorization: Bearer ${{ secrets.VULTR_API_KEY }}" \
+          "$VULTR_API_URL/snapshots")
+        
+        if [ $? -eq 0 ]; then
+          current_snapshot_count=$(echo "$final_snapshots" | jq -r '.snapshots | length')
+          echo "📊 Current snapshots: $current_snapshot_count"
+          
+          if [ "$current_snapshot_count" -gt 0 ]; then
+            echo "Recent snapshots:"
+            echo "$final_snapshots" | jq -r '.snapshots[] | "- \(.description) | Status: \(.status) | Size: \(.size_bytes // 0 | tonumber / 1024 / 1024 / 1024 | floor)GB"'
+          fi
+        fi
+        
+        echo ""
+        echo "✅ Snapshot management workflow completed"
 
-      env:
-        VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
+    - name: Cleanup temporary files
+      if: always()
+      run: |
+        echo "🧹 Cleaning up temporary files..."
+        rm -f instances.json active_instances.json snapshot_jobs.json
+        echo "✅ Cleanup completed"
