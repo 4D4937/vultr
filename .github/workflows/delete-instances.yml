@@ -1,4 +1,4 @@
-name: Delete Vultr Instances
+name: Clean Snapshots, Snapshot Vultr Instances
 
 on:
   schedule:
@@ -6,25 +6,140 @@ on:
   workflow_dispatch: # 允许手动触发
 
 jobs:
-  delete-instances:
+  clean-snapshot-instances:
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout
       uses: actions/checkout@v3
 
-    - name: Delete all Vultr instances
+    - name: Delete all snapshots and create new snapshots
       run: |
         API_KEY=${{ secrets.VULTR_API_KEY }}
         BASE_URL="https://api.vultr.com/v2"
 
-        # 获取所有实例的 ID
-        INSTANCE_IDS=$(curl -s -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances" | jq -r '.instances[].id')
+        # 第一步：删除所有现有快照
+        echo "=== Step 1: Deleting all existing snapshots ==="
+        SNAPSHOTS=$(curl -s -H "Authorization: Bearer $API_KEY" "${BASE_URL}/snapshots")
+        SNAPSHOT_IDS=$(echo "$SNAPSHOTS" | jq -r '.snapshots[].id')
 
-        # 循环遍历每个实例 ID 并删除
+        if [ -n "$SNAPSHOT_IDS" ] && [ "$SNAPSHOT_IDS" != "" ]; then
+          for SNAPSHOT_ID in $SNAPSHOT_IDS; do
+            SNAPSHOT_DESC=$(echo "$SNAPSHOTS" | jq -r ".snapshots[] | select(.id==\"$SNAPSHOT_ID\") | .description")
+            echo "Deleting snapshot ID: $SNAPSHOT_ID (Description: $SNAPSHOT_DESC)"
+            DELETE_RESPONSE=$(curl -s -X DELETE -H "Authorization: Bearer $API_KEY" "${BASE_URL}/snapshots/$SNAPSHOT_ID")
+            if [ -z "$DELETE_RESPONSE" ]; then
+              echo "Snapshot $SNAPSHOT_ID deleted successfully"
+            else
+              echo "Response for snapshot $SNAPSHOT_ID deletion: $DELETE_RESPONSE"
+            fi
+          done
+          echo "All existing snapshots deleted"
+        else
+          echo "No existing snapshots found"
+        fi
+
+        # 等待快照删除完成
+        sleep 10
+
+        # 第二步：获取所有实例信息
+        echo "=== Step 2: Getting instance information ==="
+        INSTANCES=$(curl -s -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances")
+        INSTANCE_IDS=$(echo "$INSTANCES" | jq -r '.instances[].id')
+
+        if [ -z "$INSTANCE_IDS" ] || [ "$INSTANCE_IDS" = "" ]; then
+          echo "No instances found"
+          exit 0
+        fi
+
+        echo "Found instances: $(echo "$INSTANCE_IDS" | wc -w)"
+
+        # 第三步：为每个实例创建新快照
+        echo "=== Step 3: Creating new snapshots ==="
+        declare -A SNAPSHOT_MAP
         for ID in $INSTANCE_IDS; do
-          echo "Deleting instance ID: $ID"
-          curl -s -X DELETE -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances/$ID"
+          INSTANCE_LABEL=$(echo "$INSTANCES" | jq -r ".instances[] | select(.id==\"$ID\") | .label")
+          SNAPSHOT_DESCRIPTION="Backup snapshot of $INSTANCE_LABEL - $(date '+%Y-%m-%d %H:%M:%S')"
+          
+          echo "Creating snapshot for instance ID: $ID (Label: $INSTANCE_LABEL)"
+          
+          SNAPSHOT_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"description\": \"$SNAPSHOT_DESCRIPTION\"}" \
+            "${BASE_URL}/instances/$ID/snapshots")
+          
+          SNAPSHOT_ID=$(echo "$SNAPSHOT_RESPONSE" | jq -r '.snapshot.id')
+          
+          if [ "$SNAPSHOT_ID" != "null" ] && [ -n "$SNAPSHOT_ID" ]; then
+            echo "Snapshot created successfully: $SNAPSHOT_ID"
+            SNAPSHOT_MAP[$ID]=$SNAPSHOT_ID
+          else
+            echo "Failed to create snapshot for instance $ID"
+            echo "Response: $SNAPSHOT_RESPONSE"
+          fi
         done
+
+        # 第四步：等待快照创建完成
+        echo "=== Step 4: Waiting for snapshots to complete ==="
+        sleep 30
+
+        # 检查快照状态并等待完成
+        for ID in "${!SNAPSHOT_MAP[@]}"; do
+          SNAPSHOT_ID=${SNAPSHOT_MAP[$ID]}
+          echo "Checking snapshot status for instance $ID (snapshot: $SNAPSHOT_ID)"
+          
+          # 最多等待10分钟
+          MAX_ATTEMPTS=20
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            SNAPSHOT_STATUS=$(curl -s -H "Authorization: Bearer $API_KEY" \
+              "${BASE_URL}/snapshots/$SNAPSHOT_ID" | jq -r '.snapshot.status')
+            
+            echo "Snapshot $SNAPSHOT_ID status: $SNAPSHOT_STATUS"
+            
+            if [ "$SNAPSHOT_STATUS" = "complete" ]; then
+              echo "Snapshot $SNAPSHOT_ID is complete"
+              break
+            elif [ "$SNAPSHOT_STATUS" = "pending" ]; then
+              echo "Snapshot $SNAPSHOT_ID is still pending, waiting..."
+              sleep 30
+              ATTEMPT=$((ATTEMPT + 1))
+            else
+              echo "Snapshot status: $SNAPSHOT_STATUS (continuing anyway)"
+              break
+            fi
+          done
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "Warning: Snapshot $SNAPSHOT_ID did not complete within the timeout period"
+          fi
+        done
+
+        # 第五步：删除所有实例 (已注释)
+        # echo "=== Step 5: Deleting all instances ==="
+        # for ID in $INSTANCE_IDS; do
+        #   echo "Deleting instance ID: $ID"
+        #   DELETE_RESPONSE=$(curl -s -X DELETE -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances/$ID")
+        #   
+        #   if [ -z "$DELETE_RESPONSE" ]; then
+        #     echo "Instance $ID deletion initiated successfully"
+        #   else
+        #     echo "Response for instance $ID deletion: $DELETE_RESPONSE"
+        #   fi
+        # done
+
+        # 操作总结
+        echo "=== Operation Summary ==="
+        DELETED_SNAPSHOTS=$(echo "$SNAPSHOT_IDS" | wc -w)
+        CREATED_SNAPSHOTS=${#SNAPSHOT_MAP[@]}
+        TOTAL_INSTANCES=$(echo "$INSTANCE_IDS" | wc -w)
+        
+        echo "Deleted old snapshots: $DELETED_SNAPSHOTS"
+        echo "Created new snapshots: $CREATED_SNAPSHOTS"
+        echo "Total instances (preserved): $TOTAL_INSTANCES"
+        echo "Snapshot operations completed!"
+
       env:
         VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
