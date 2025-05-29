@@ -42,9 +42,12 @@ jobs:
         # 等待快照删除完成
         sleep 10
 
-        # 第二步：获取所有实例信息
+        # 第二步：获取所有实例信息并显示详细信息
         echo "=== Step 2: Getting instance information ==="
         INSTANCES=$(curl -s -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances")
+        echo "Full instances response:"
+        echo "$INSTANCES" | jq '.'
+        
         INSTANCE_IDS=$(echo "$INSTANCES" | jq -r '.instances[].id')
 
         if [ -z "$INSTANCE_IDS" ] || [ "$INSTANCE_IDS" = "" ]; then
@@ -54,81 +57,125 @@ jobs:
 
         echo "Found instances: $(echo "$INSTANCE_IDS" | wc -w)"
 
+        # 显示每个实例的详细信息
+        echo "=== Instance Details ==="
+        for ID in $INSTANCE_IDS; do
+          echo "Checking instance: $ID"
+          INSTANCE_INFO=$(echo "$INSTANCES" | jq -r ".instances[] | select(.id==\"$ID\")")
+          echo "Instance details:"
+          echo "$INSTANCE_INFO" | jq '.'
+          
+          STATUS=$(echo "$INSTANCE_INFO" | jq -r '.status')
+          POWER_STATUS=$(echo "$INSTANCE_INFO" | jq -r '.power_status')
+          SERVER_STATUS=$(echo "$INSTANCE_INFO" | jq -r '.server_status')
+          PLAN=$(echo "$INSTANCE_INFO" | jq -r '.plan')
+          REGION=$(echo "$INSTANCE_INFO" | jq -r '.region')
+          
+          echo "Instance $ID - Status: $STATUS, Power: $POWER_STATUS, Server: $SERVER_STATUS, Plan: $PLAN, Region: $REGION"
+        done
+
         # 第三步：为每个实例创建新快照
         echo "=== Step 3: Creating new snapshots ==="
         declare -A SNAPSHOT_MAP
         for ID in $INSTANCE_IDS; do
           INSTANCE_LABEL=$(echo "$INSTANCES" | jq -r ".instances[] | select(.id==\"$ID\") | .label")
+          INSTANCE_STATUS=$(echo "$INSTANCES" | jq -r ".instances[] | select(.id==\"$ID\") | .status")
+          POWER_STATUS=$(echo "$INSTANCES" | jq -r ".instances[] | select(.id==\"$ID\") | .power_status")
+          
+          # 如果标签为空，使用实例ID的前8位作为标识
+          if [ "$INSTANCE_LABEL" = "null" ] || [ -z "$INSTANCE_LABEL" ]; then
+            INSTANCE_LABEL=$(echo "$ID" | cut -c1-8)
+          fi
+          
           SNAPSHOT_DESCRIPTION="Backup snapshot of $INSTANCE_LABEL - $(date '+%Y-%m-%d %H:%M:%S')"
           
-          echo "Creating snapshot for instance ID: $ID (Label: $INSTANCE_LABEL)"
+          echo "Creating snapshot for instance ID: $ID"
+          echo "  Label: $INSTANCE_LABEL"
+          echo "  Status: $INSTANCE_STATUS"
+          echo "  Power Status: $POWER_STATUS"
+          echo "  Snapshot Description: $SNAPSHOT_DESCRIPTION"
           
-          SNAPSHOT_RESPONSE=$(curl -s -X POST \
+          # 检查实例状态
+          if [ "$INSTANCE_STATUS" != "active" ]; then
+            echo "  Warning: Instance $ID is not in 'active' status, attempting snapshot anyway..."
+          fi
+          
+          # 尝试创建快照
+          echo "  Making API call to create snapshot..."
+          SNAPSHOT_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST \
             -H "Authorization: Bearer $API_KEY" \
             -H "Content-Type: application/json" \
             -d "{\"description\": \"$SNAPSHOT_DESCRIPTION\"}" \
             "${BASE_URL}/instances/$ID/snapshots")
           
-          SNAPSHOT_ID=$(echo "$SNAPSHOT_RESPONSE" | jq -r '.snapshot.id')
+          # 分离HTTP状态码和响应体
+          HTTP_STATUS=$(echo "$SNAPSHOT_RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
+          RESPONSE_BODY=$(echo "$SNAPSHOT_RESPONSE" | sed '/HTTP_STATUS:/d')
           
-          if [ "$SNAPSHOT_ID" != "null" ] && [ -n "$SNAPSHOT_ID" ]; then
-            echo "Snapshot created successfully: $SNAPSHOT_ID"
-            SNAPSHOT_MAP[$ID]=$SNAPSHOT_ID
+          echo "  HTTP Status: $HTTP_STATUS"
+          echo "  Response Body: $RESPONSE_BODY"
+          
+          if [ "$HTTP_STATUS" = "201" ] || [ "$HTTP_STATUS" = "200" ]; then
+            SNAPSHOT_ID=$(echo "$RESPONSE_BODY" | jq -r '.snapshot.id')
+            if [ "$SNAPSHOT_ID" != "null" ] && [ -n "$SNAPSHOT_ID" ]; then
+              echo "  Snapshot created successfully: $SNAPSHOT_ID"
+              SNAPSHOT_MAP[$ID]=$SNAPSHOT_ID
+            else
+              echo "  Failed to extract snapshot ID from response"
+            fi
           else
-            echo "Failed to create snapshot for instance $ID"
-            echo "Response: $SNAPSHOT_RESPONSE"
+            echo "  Failed to create snapshot for instance $ID"
+            echo "  Error details: $RESPONSE_BODY"
+            
+            # 尝试获取更详细的实例信息
+            echo "  Getting detailed instance info..."
+            DETAILED_INFO=$(curl -s -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances/$ID")
+            echo "  Detailed instance info: $DETAILED_INFO"
           fi
+          
+          echo "  ---"
         done
 
         # 第四步：等待快照创建完成
-        echo "=== Step 4: Waiting for snapshots to complete ==="
-        sleep 30
+        if [ ${#SNAPSHOT_MAP[@]} -gt 0 ]; then
+          echo "=== Step 4: Waiting for snapshots to complete ==="
+          sleep 30
 
-        # 检查快照状态并等待完成
-        for ID in "${!SNAPSHOT_MAP[@]}"; do
-          SNAPSHOT_ID=${SNAPSHOT_MAP[$ID]}
-          echo "Checking snapshot status for instance $ID (snapshot: $SNAPSHOT_ID)"
-          
-          # 最多等待10分钟
-          MAX_ATTEMPTS=20
-          ATTEMPT=0
-          
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            SNAPSHOT_STATUS=$(curl -s -H "Authorization: Bearer $API_KEY" \
-              "${BASE_URL}/snapshots/$SNAPSHOT_ID" | jq -r '.snapshot.status')
+          # 检查快照状态并等待完成
+          for ID in "${!SNAPSHOT_MAP[@]}"; do
+            SNAPSHOT_ID=${SNAPSHOT_MAP[$ID]}
+            echo "Checking snapshot status for instance $ID (snapshot: $SNAPSHOT_ID)"
             
-            echo "Snapshot $SNAPSHOT_ID status: $SNAPSHOT_STATUS"
+            # 最多等待10分钟
+            MAX_ATTEMPTS=20
+            ATTEMPT=0
             
-            if [ "$SNAPSHOT_STATUS" = "complete" ]; then
-              echo "Snapshot $SNAPSHOT_ID is complete"
-              break
-            elif [ "$SNAPSHOT_STATUS" = "pending" ]; then
-              echo "Snapshot $SNAPSHOT_ID is still pending, waiting..."
-              sleep 30
-              ATTEMPT=$((ATTEMPT + 1))
-            else
-              echo "Snapshot status: $SNAPSHOT_STATUS (continuing anyway)"
-              break
+            while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+              SNAPSHOT_STATUS=$(curl -s -H "Authorization: Bearer $API_KEY" \
+                "${BASE_URL}/snapshots/$SNAPSHOT_ID" | jq -r '.snapshot.status')
+              
+              echo "Snapshot $SNAPSHOT_ID status: $SNAPSHOT_STATUS"
+              
+              if [ "$SNAPSHOT_STATUS" = "complete" ]; then
+                echo "Snapshot $SNAPSHOT_ID is complete"
+                break
+              elif [ "$SNAPSHOT_STATUS" = "pending" ]; then
+                echo "Snapshot $SNAPSHOT_ID is still pending, waiting..."
+                sleep 30
+                ATTEMPT=$((ATTEMPT + 1))
+              else
+                echo "Snapshot status: $SNAPSHOT_STATUS (continuing anyway)"
+                break
+              fi
+            done
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "Warning: Snapshot $SNAPSHOT_ID did not complete within the timeout period"
             fi
           done
-          
-          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-            echo "Warning: Snapshot $SNAPSHOT_ID did not complete within the timeout period"
-          fi
-        done
-
-        # 第五步：删除所有实例 (已注释)
-        # echo "=== Step 5: Deleting all instances ==="
-        # for ID in $INSTANCE_IDS; do
-        #   echo "Deleting instance ID: $ID"
-        #   DELETE_RESPONSE=$(curl -s -X DELETE -H "Authorization: Bearer $API_KEY" "${BASE_URL}/instances/$ID")
-        #   
-        #   if [ -z "$DELETE_RESPONSE" ]; then
-        #     echo "Instance $ID deletion initiated successfully"
-        #   else
-        #     echo "Response for instance $ID deletion: $DELETE_RESPONSE"
-        #   fi
-        # done
+        else
+          echo "=== No snapshots were created ==="
+        fi
 
         # 操作总结
         echo "=== Operation Summary ==="
