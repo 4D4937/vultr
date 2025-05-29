@@ -87,6 +87,7 @@ jobs:
         if [ "$snapshot_count" -eq 0 ]; then
           echo "✅ 没有现有快照需要删除"
           echo "0" > /tmp/deleted_count
+          echo "false" > /tmp/snapshots_deleted
         else
           deleted_count=0
           failed_count=0
@@ -124,9 +125,39 @@ jobs:
           
           echo "$deleted_count" > /tmp/deleted_count
           echo "$failed_count" > /tmp/failed_delete_count
+          
+          # 标记有快照被删除
+          if [ "$deleted_count" -gt 0 ]; then
+            echo "true" > /tmp/snapshots_deleted
+          else
+            echo "false" > /tmp/snapshots_deleted
+          fi
         fi
         
         echo "=== 快照删除完成 ==="
+
+    - name: ⏳ 等待清理完成
+      run: |
+        snapshots_deleted=$(cat /tmp/snapshots_deleted 2>/dev/null || echo "false")
+        deleted_count=$(cat /tmp/deleted_count 2>/dev/null || echo "0")
+        
+        if [ "$snapshots_deleted" == "true" ] && [ "$deleted_count" -gt 0 ]; then
+          echo "=== 等待快照删除完全完成 ==="
+          echo "⏳ 已删除 $deleted_count 个快照，等待系统清理..."
+          echo "💤 等待5分钟以确保删除操作完全完成..."
+          
+          # 5分钟倒计时显示
+          total_seconds=300
+          for i in $(seq $total_seconds -30 1); do
+            minutes=$((i / 60))
+            seconds=$((i % 60))
+            printf "\r⏰ 剩余时间: %02d:%02d" $minutes $seconds
+            sleep 30
+          done
+          printf "\r✅ 等待完成，系统已清理        \n"
+        else
+          echo "ℹ️ 没有删除快照，无需等待"
+        fi
 
     - name: 📋 第二步：获取Vultr实例信息
       run: |
@@ -340,6 +371,12 @@ jobs:
         
         echo "📸 快照创建请求: $created_count 个"
         echo "✅ 快照创建完成: $completed_count/$total_snapshots 个"
+        
+        # 等待时间信息
+        snapshots_deleted=$(cat /tmp/snapshots_deleted 2>/dev/null || echo "false")
+        if [ "$snapshots_deleted" == "true" ]; then
+          echo "⏰ 删除后等待: 5分钟"
+        fi
         
         # 状态判断
         if [ "$completed_count" -eq "$total_snapshots" ] && [ "$total_snapshots" -gt 0 ]; then
