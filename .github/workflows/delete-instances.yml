@@ -1,4 +1,4 @@
-name: Vultr Automated Snapshot Management
+name: Vultr Automated Snapshot Management with Instance Cleanup
 
 on:
   schedule:
@@ -15,6 +15,11 @@ on:
         required: false
         default: '30'
         type: string
+      delete_instances:
+        description: '快照成功后删除所有实例（true/false）'
+        required: false
+        default: 'true'
+        type: boolean
 
 env:
   VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
@@ -24,7 +29,7 @@ jobs:
   snapshot-management:
     name: Vultr Snapshot Management
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
     - name: 🔧 Checkout Repository
@@ -36,12 +41,15 @@ jobs:
         echo "SNAPSHOT_TIMESTAMP=$(date '+%Y%m%d_%H%M%S')" >> $GITHUB_ENV
         echo "TIMEOUT_MINUTES=${{ github.event.inputs.timeout_minutes || '30' }}" >> $GITHUB_ENV
         echo "FORCE_DELETE=${{ github.event.inputs.force_delete || 'true' }}" >> $GITHUB_ENV
+        echo "DELETE_INSTANCES=${{ github.event.inputs.delete_instances || 'true' }}" >> $GITHUB_ENV
         
         # 初始化状态文件
         echo "0" > /tmp/deleted_count
         echo "0" > /tmp/failed_delete_count
         echo "" > /tmp/created_snapshots
         echo "0" > /tmp/success_count
+        echo "0" > /tmp/instances_deleted
+        echo "0" > /tmp/instances_delete_failed
 
     - name: ✅ Validate API Configuration
       run: |
@@ -65,6 +73,7 @@ jobs:
         echo "✅ API连接测试成功"
         echo "🌐 API端点: $VULTR_API_URL"
         echo "⏰ 工作流启动时间: $WORKFLOW_START_TIME"
+        echo "🗑️ 删除实例设置: $DELETE_INSTANCES"
 
     - name: 🗑️ 第一步：删除现有快照
       run: |
@@ -182,6 +191,7 @@ jobs:
           echo "0" > /tmp/instance_count
           echo "0" > /tmp/active_count
           echo "" > /tmp/active_instances
+          echo "" > /tmp/all_instances
         else
           # 显示实例详情
           echo "📋 实例详细信息:"
@@ -194,8 +204,9 @@ jobs:
              📅 创建时间: \(.date_created // "未知")
              =================="' /tmp/instances.json
           
-          # 保存活跃实例ID
+          # 保存活跃实例ID和所有实例ID
           jq -r '[.instances[]? | select(.status == "active") | .id] | join(" ")' /tmp/instances.json > /tmp/active_instances
+          jq -r '[.instances[]? | .id] | join(" ")' /tmp/instances.json > /tmp/all_instances
           active_count=$(jq -r '[.instances[]? | select(.status == "active")] | length' /tmp/instances.json)
           
           echo "🟢 活跃实例数量: $active_count"
@@ -273,6 +284,7 @@ jobs:
           echo "⚠️ 没有需要监控的快照"
           echo "0" > /tmp/final_completed
           echo "0" > /tmp/total_snapshots
+          echo "false" > /tmp/all_snapshots_complete
         else
           echo "📊 监控快照: $created_snapshots"
           echo "⏱️ 超时时间: $timeout_minutes 分钟"
@@ -333,62 +345,181 @@ jobs:
           
           echo "$completed_count" > /tmp/final_completed  
           echo "$total_snapshots" > /tmp/total_snapshots
+          
+          # 检查是否所有快照都完成
+          if [ "$completed_count" -eq "$total_snapshots" ] && [ "$total_snapshots" -gt 0 ]; then
+            echo "true" > /tmp/all_snapshots_complete
+            echo "🎉 所有快照创建完成！"
+          else
+            echo "false" > /tmp/all_snapshots_complete
+            echo "⚠️ 并非所有快照都完成"
+          fi
         fi
         
         echo "=== 快照监控完成 ==="
 
+    - name: 🔥 第五步：删除所有实例
+      run: |
+        echo "=== 删除所有实例 ==="
+        
+        all_snapshots_complete=$(cat /tmp/all_snapshots_complete 2>/dev/null || echo "false")
+        all_instances=$(cat /tmp/all_instances 2>/dev/null || echo "")
+        total_snapshots=$(cat /tmp/total_snapshots 2>/dev/null || echo "0")
+        
+        echo "🔍 检查删除条件:"
+        echo "   - 删除实例设置: $DELETE_INSTANCES"
+        echo "   - 快照全部完成: $all_snapshots_complete"
+        echo "   - 快照总数: $total_snapshots"
+        echo "   - 实例列表: $all_instances"
+        
+        # 检查是否应该删除实例
+        if [ "$DELETE_INSTANCES" != "true" ]; then
+          echo "⚠️ 跳过删除实例 (delete_instances=false)"
+          echo "0" > /tmp/instances_deleted
+          echo "0" > /tmp/instances_delete_failed
+        elif [ "$all_snapshots_complete" != "true" ]; then
+          echo "⚠️ 跳过删除实例 (快照未全部完成)"
+          echo "0" > /tmp/instances_deleted
+          echo "0" > /tmp/instances_delete_failed
+        elif [ "$total_snapshots" -eq 0 ]; then
+          echo "⚠️ 跳过删除实例 (没有成功创建快照)"
+          echo "0" > /tmp/instances_deleted
+          echo "0" > /tmp/instances_delete_failed
+        elif [ -z "$all_instances" ]; then
+          echo "ℹ️ 没有实例需要删除"
+          echo "0" > /tmp/instances_deleted
+          echo "0" > /tmp/instances_delete_failed
+        else
+          echo "🔥 开始删除所有实例..."
+          echo "⚠️  警告: 这将删除所有实例，操作不可逆！"
+          
+          deleted_instances=0
+          failed_instances=0
+          
+          for instance_id in $all_instances; do
+            if [ -n "$instance_id" ] && [ "$instance_id" != "null" ]; then
+              # 获取实例信息
+              instance_info=$(curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
+                "$VULTR_API_URL/instances/$instance_id")
+              
+              instance_label=$(echo "$instance_info" | jq -r '.instance.label // "未知"')
+              instance_ip=$(echo "$instance_info" | jq -r '.instance.main_ip // "未分配"')
+              instance_status=$(echo "$instance_info" | jq -r '.instance.status // "未知"')
+              
+              echo "🔥 删除实例: $instance_id"
+              echo "   📍 标签: $instance_label"
+              echo "   🌐 IP: $instance_ip" 
+              echo "   🔋 状态: $instance_status"
+              
+              # 删除实例
+              delete_response=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $VULTR_API_KEY" \
+                -X DELETE "$VULTR_API_URL/instances/$instance_id" -o /tmp/instance_delete_response.json)
+              
+              delete_http_code=$(echo "$delete_response" | tail -c 4)
+              
+              if [ "$delete_http_code" = "204" ] || [ "$delete_http_code" = "200" ] || [ "$delete_http_code" = "404" ]; then
+                echo "   ✅ 实例删除成功"
+                deleted_instances=$((deleted_instances + 1))
+              else
+                echo "   ❌ 实例删除失败 (HTTP $delete_http_code)"
+                if [ -s /tmp/instance_delete_response.json ]; then
+                  error_msg=$(jq -r '.error // "未知错误"' /tmp/instance_delete_response.json)
+                  echo "   错误信息: $error_msg"
+                fi
+                failed_instances=$((failed_instances + 1))
+              fi
+              
+              # 避免API限制
+              sleep 3
+            fi
+          done
+          
+          echo "$deleted_instances" > /tmp/instances_deleted
+          echo "$failed_instances" > /tmp/instances_delete_failed
+          
+          echo "📊 实例删除结果:"
+          echo "   ✅ 成功删除: $deleted_instances 个"
+          echo "   ❌ 删除失败: $failed_instances 个"
+        fi
+        
+        echo "=== 实例删除完成 ==="
+
     - name: 📊 生成操作总结报告
       if: always()
       run: |
-        echo "=== Vultr快照管理总结报告 ==="
+        echo "=== Vultr快照管理与实例清理总结报告 ==="
         echo "🕐 执行时间: $WORKFLOW_START_TIME"
         echo "⚙️ 触发方式: ${{ github.event_name }}"
         
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
           echo "👤 手动触发参数:"
-          echo "   - 强制删除: ${{ github.event.inputs.force_delete }}"
+          echo "   - 强制删除快照: ${{ github.event.inputs.force_delete }}"
           echo "   - 超时时间: ${{ github.event.inputs.timeout_minutes }}分钟"
+          echo "   - 删除实例: ${{ github.event.inputs.delete_instances }}"
         fi
         
         echo ""
-        echo "📋 操作结果:"
+        echo "📋 操作结果总览:"
         
         # 删除快照结果
         deleted_count=$(cat /tmp/deleted_count 2>/dev/null || echo "0")
         failed_delete_count=$(cat /tmp/failed_delete_count 2>/dev/null || echo "0")
-        echo "🗑️ 删除快照: $deleted_count 个成功, $failed_delete_count 个失败"
+        echo "🗑️ 旧快照删除: $deleted_count 个成功, $failed_delete_count 个失败"
         
         # 实例信息  
         total_instances=$(cat /tmp/instance_count 2>/dev/null || echo "0")
         active_instances=$(cat /tmp/active_count 2>/dev/null || echo "0") 
-        echo "🖥️ 总实例数: $total_instances 个"
-        echo "🟢 活跃实例: $active_instances 个"
+        echo "🖥️ 发现实例: $total_instances 个总计, $active_instances 个活跃"
         
         # 快照创建结果
         created_count=$(cat /tmp/success_count 2>/dev/null || echo "0")
         completed_count=$(cat /tmp/final_completed 2>/dev/null || echo "0") 
         total_snapshots=$(cat /tmp/total_snapshots 2>/dev/null || echo "0")
+        echo "📸 快照创建: $created_count 个请求, $completed_count/$total_snapshots 个完成"
         
-        echo "📸 快照创建请求: $created_count 个"
-        echo "✅ 快照创建完成: $completed_count/$total_snapshots 个"
+        # 实例删除结果
+        instances_deleted=$(cat /tmp/instances_deleted 2>/dev/null || echo "0")
+        instances_delete_failed=$(cat /tmp/instances_delete_failed 2>/dev/null || echo "0")
+        echo "🔥 实例删除: $instances_deleted 个成功, $instances_delete_failed 个失败"
         
         # 等待时间信息
         snapshots_deleted=$(cat /tmp/snapshots_deleted 2>/dev/null || echo "false")
         if [ "$snapshots_deleted" == "true" ]; then
-          echo "⏰ 删除后等待: 5分钟"
+          echo "⏰ 删除等待: 5分钟清理时间"
         fi
         
         # 状态判断
-        if [ "$completed_count" -eq "$total_snapshots" ] && [ "$total_snapshots" -gt 0 ]; then
-          echo "🎉 状态: 全部成功"
-          exit 0
+        echo ""
+        echo "🎯 最终状态评估:"
+        
+        all_snapshots_complete=$(cat /tmp/all_snapshots_complete 2>/dev/null || echo "false")
+        
+        if [ "$all_snapshots_complete" == "true" ] && [ "$instances_deleted" -gt 0 ]; then
+          echo "🎉 完全成功: 所有快照完成，实例已清理"
+          echo "💡 建议: 可以随时使用快照恢复实例"
+        elif [ "$all_snapshots_complete" == "true" ] && [ "$DELETE_INSTANCES" != "true" ]; then
+          echo "✅ 快照成功: 所有快照完成，实例保留"
+          echo "💡 提示: 如需清理实例，请设置 delete_instances=true"
+        elif [ "$all_snapshots_complete" == "true" ] && [ "$instances_deleted" -eq 0 ]; then
+          echo "⚠️ 部分完成: 快照成功但实例删除失败"
+          echo "💡 建议: 检查实例删除失败原因"
         elif [ "$completed_count" -gt 0 ]; then
-          echo "⚠️ 状态: 部分成功"
-          exit 0
+          echo "⚠️ 部分成功: 部分快照完成"
+          echo "💡 建议: 检查未完成的快照状态"
         elif [ "$total_snapshots" -gt 0 ]; then
-          echo "❌ 状态: 失败"
-          exit 0
+          echo "❌ 任务失败: 快照创建失败"
+          echo "💡 建议: 检查API权限和实例状态"
         else
-          echo "💡 状态: 无操作需要执行"
-          exit 0
+          echo "💡 无操作: 没有需要处理的实例"
         fi
+        
+        # 安全提示
+        if [ "$instances_deleted" -gt 0 ]; then
+          echo ""
+          echo "🔒 安全提醒:"
+          echo "   ⚠️ $instances_deleted 个实例已被永久删除"
+          echo "   📸 可使用创建的快照恢复实例"
+          echo "   💰 删除实例将停止计费"
+        fi
+        
+        exit 0
