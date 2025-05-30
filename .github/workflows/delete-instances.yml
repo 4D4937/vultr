@@ -75,7 +75,59 @@ jobs:
         echo "⏰ 工作流启动时间: $WORKFLOW_START_TIME"
         echo "🗑️ 删除实例设置: $DELETE_INSTANCES"
 
-    - name: 🗑️ 第一步：删除现有快照
+    - name: 🔍 第一步：检查实例是否存在
+      id: check_instances
+      run: |
+        echo "=== 检查Vultr实例是否存在 ==="
+        
+        # 获取所有实例
+        instances_response=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $VULTR_API_KEY" \
+          "$VULTR_API_URL/instances" -o /tmp/instances.json)
+        
+        http_code=$(echo "$instances_response" | tail -c 4)
+        if [ "$http_code" != "200" ]; then
+          echo "❌ 获取实例列表失败 (HTTP $http_code)"
+          exit 1
+        fi
+        
+        # 检查响应格式
+        instance_count=$(jq -r '.instances | length // 0' /tmp/instances.json)
+        echo "📊 发现 $instance_count 个实例"
+        
+        if [ "$instance_count" -eq 0 ]; then
+          echo "⚠️ 没有发现任何实例，跳过所有后续操作"
+          echo "0" > /tmp/instance_count
+          echo "0" > /tmp/active_count
+          echo "" > /tmp/active_instances
+          echo "" > /tmp/all_instances
+          echo "no_instances=true" >> $GITHUB_OUTPUT
+          echo "::notice title=无实例检测::没有发现任何实例，工作流将跳过所有快照和删除操作"
+        else
+          # 显示实例详情
+          echo "📋 实例详细信息:"
+          jq -r '.instances[]? | 
+            "🖥️ 实例ID: \(.id // "未知")
+             📍 标签: \(.label // "未命名")  
+             🔋 状态: \(.status // "未知") | 电源: \(.power_status // "未知")
+             💾 计划: \(.plan // "未知") | 区域: \(.region // "未知")
+             🌐 主IP: \(.main_ip // "未分配")
+             📅 创建时间: \(.date_created // "未知")
+             =================="' /tmp/instances.json
+          
+          # 保存活跃实例ID和所有实例ID
+          jq -r '[.instances[]? | select(.status == "active") | .id] | join(" ")' /tmp/instances.json > /tmp/active_instances
+          jq -r '[.instances[]? | .id] | join(" ")' /tmp/instances.json > /tmp/all_instances
+          active_count=$(jq -r '[.instances[]? | select(.status == "active")] | length' /tmp/instances.json)
+          
+          echo "🟢 活跃实例数量: $active_count"
+          echo "$instance_count" > /tmp/instance_count
+          echo "$active_count" > /tmp/active_count
+          echo "no_instances=false" >> $GITHUB_OUTPUT
+          echo "✅ 发现实例，继续执行工作流"
+        fi
+
+    - name: 🗑️ 第二步：删除现有快照
+      if: steps.check_instances.outputs.no_instances == 'false'
       run: |
         echo "=== 开始删除现有快照 ==="
         
@@ -146,6 +198,7 @@ jobs:
         echo "=== 快照删除完成 ==="
 
     - name: ⏳ 等待清理完成
+      if: steps.check_instances.outputs.no_instances == 'false'
       run: |
         snapshots_deleted=$(cat /tmp/snapshots_deleted 2>/dev/null || echo "false")
         deleted_count=$(cat /tmp/deleted_count 2>/dev/null || echo "0")
@@ -168,53 +221,8 @@ jobs:
           echo "ℹ️ 没有删除快照，无需等待"
         fi
 
-    - name: 📋 第二步：获取Vultr实例信息
-      run: |
-        echo "=== 获取Vultr实例信息 ==="
-        
-        # 获取所有实例
-        instances_response=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $VULTR_API_KEY" \
-          "$VULTR_API_URL/instances" -o /tmp/instances.json)
-        
-        http_code=$(echo "$instances_response" | tail -c 4)
-        if [ "$http_code" != "200" ]; then
-          echo "❌ 获取实例列表失败 (HTTP $http_code)"
-          exit 1
-        fi
-        
-        # 检查响应格式
-        instance_count=$(jq -r '.instances | length // 0' /tmp/instances.json)
-        echo "📊 发现 $instance_count 个实例"
-        
-        if [ "$instance_count" -eq 0 ]; then
-          echo "⚠️ 没有发现任何实例"
-          echo "0" > /tmp/instance_count
-          echo "0" > /tmp/active_count
-          echo "" > /tmp/active_instances
-          echo "" > /tmp/all_instances
-        else
-          # 显示实例详情
-          echo "📋 实例详细信息:"
-          jq -r '.instances[]? | 
-            "🖥️ 实例ID: \(.id // "未知")
-             📍 标签: \(.label // "未命名")  
-             🔋 状态: \(.status // "未知") | 电源: \(.power_status // "未知")
-             💾 计划: \(.plan // "未知") | 区域: \(.region // "未知")
-             🌐 主IP: \(.main_ip // "未分配")
-             📅 创建时间: \(.date_created // "未知")
-             =================="' /tmp/instances.json
-          
-          # 保存活跃实例ID和所有实例ID
-          jq -r '[.instances[]? | select(.status == "active") | .id] | join(" ")' /tmp/instances.json > /tmp/active_instances
-          jq -r '[.instances[]? | .id] | join(" ")' /tmp/instances.json > /tmp/all_instances
-          active_count=$(jq -r '[.instances[]? | select(.status == "active")] | length' /tmp/instances.json)
-          
-          echo "🟢 活跃实例数量: $active_count"
-          echo "$instance_count" > /tmp/instance_count
-          echo "$active_count" > /tmp/active_count
-        fi
-
     - name: 📸 第三步：创建新快照
+      if: steps.check_instances.outputs.no_instances == 'false'
       run: |
         echo "=== 开始创建新快照 ==="
         
@@ -274,6 +282,7 @@ jobs:
         echo "=== 快照创建请求完成 ==="
 
     - name: ⏳ 第四步：监控快照创建状态
+      if: steps.check_instances.outputs.no_instances == 'false'
       run: |
         echo "=== 监控快照创建状态 ==="
         
@@ -359,6 +368,7 @@ jobs:
         echo "=== 快照监控完成 ==="
 
     - name: 🔥 第五步：删除所有实例
+      if: steps.check_instances.outputs.no_instances == 'false'
       run: |
         echo "=== 删除所有实例 ==="
         
@@ -450,6 +460,25 @@ jobs:
         echo "=== Vultr快照管理与实例清理总结报告 ==="
         echo "🕐 执行时间: $WORKFLOW_START_TIME"
         echo "⚙️ 触发方式: ${{ github.event_name }}"
+        
+        # 检查是否因为无实例而跳过
+        if [ "${{ steps.check_instances.outputs.no_instances }}" == "true" ]; then
+          echo ""
+          echo "⚠️ 工作流状态: 已跳过所有操作"
+          echo "📋 跳过原因: 未发现任何Vultr实例"
+          echo "💡 建议: 如果您有实例但未显示，请检查API权限或实例状态"
+          echo ""
+          echo "🔍 检查项目:"
+          echo "   - API密钥是否有效: ✅"
+          echo "   - API连接是否正常: ✅"
+          echo "   - 实例是否存在: ❌ (0个实例)"
+          echo ""
+          echo "📝 注意事项:"
+          echo "   - 当没有实例时，工作流会自动跳过所有快照和删除操作"
+          echo "   - 这样可以避免不必要的API调用和潜在错误"
+          echo "   - 如果您需要创建实例，请先在Vultr控制台中创建"
+          exit 0
+        fi
         
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
           echo "👤 手动触发参数:"
