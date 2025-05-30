@@ -241,8 +241,31 @@ jobs:
             if [ -n "$instance_id" ] && [ "$instance_id" != "null" ]; then
               echo "📸 为实例 $instance_id 创建快照..."
               
-              # 生成快照描述
-              snapshot_desc="AutoBackup_${SNAPSHOT_TIMESTAMP}_${instance_id}"
+              # 获取实例详细信息来获取标签/名称
+              echo "   📡 获取实例详细信息..."
+              instance_info=$(curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
+                "$VULTR_API_URL/instances/$instance_id")
+              
+              # 提取实例标签，如果没有则使用默认值
+              instance_label=$(echo "$instance_info" | jq -r '.instance.label // "unnamed"')
+              
+              # 清理标签名称，移除特殊字符以确保快照名称有效
+              clean_label=$(echo "$instance_label" | sed 's/[^a-zA-Z0-9_-]/_/g' | sed 's/__*/_/g' | sed 's/^_\|_$//g')
+              if [ -z "$clean_label" ] || [ "$clean_label" = "_" ]; then
+                clean_label="unnamed"
+              fi
+              
+              # 限制标签长度，避免快照名称过长
+              if [ ${#clean_label} -gt 20 ]; then
+                clean_label=$(echo "$clean_label" | cut -c1-20)
+              fi
+              
+              # 生成包含服务器名称的快照描述
+              snapshot_desc="AutoBackup_${clean_label}_${SNAPSHOT_TIMESTAMP}_${instance_id}"
+              
+              echo "   📋 实例原始标签: $instance_label"
+              echo "   🏷️ 清理后标签: $clean_label"
+              echo "   📝 快照名称: $snapshot_desc"
               
               # 创建快照
               create_response=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $VULTR_API_KEY" \
